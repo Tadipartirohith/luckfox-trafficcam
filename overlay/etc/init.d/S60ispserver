@@ -10,6 +10,8 @@ case "$1" in
     start)
         [ -f "$RKAIQ" ] || { echo "rkaiq_3A_server not found"; exit 0; }
         echo "Starting rkaiq_3A_server..."
+        # Kill rkipc if stock RkLunch.sh started it - it holds the VI channel
+        killall rkipc 2>/dev/null && sleep 1 || true
         RKISP_AIQ_IQ_PATH="$IQPATH" "$RKAIQ" --silent &
         echo $! > "$PIDFILE"
         ;;

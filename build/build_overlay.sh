@@ -76,6 +76,10 @@ echo "Overlay applied"
 echo "--- Packaging firmware ---"
 CLEAN_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v ' ' | tr '\n' ':' | sed 's/:$//')
 cd "$SDK"
+# Rebuild OEM partition so RkLunch.sh patch is included.
+# build.sh firmware repackages existing .img files without rebuilding
+# individual partitions, so oem must be rebuilt explicitly first.
+PATH="$CLEAN_PATH" bash build.sh oem
 PATH="$CLEAN_PATH" bash build.sh firmware
 
 # ── 4. Copy output with date suffix ───────────────────────────────────────
