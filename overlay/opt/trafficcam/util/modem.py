@@ -127,6 +127,35 @@ class ModemManager:
         finally:
             self._carrier_detected = True
 
+
+    def _init_modem(self) -> bool:
+        """Set modem to auto network mode and wait for registration.
+        Must be called before PPP dial. Returns True when registered."""
+        log.info('Initialising modem...')
+
+        # Enable auto network scan (LTE preferred, fallback to GSM/WCDMA)
+        # EC200U-CN ships with nwscanmode=3 (LTE only) which prevents 2G fallback
+        self._at('AT+QCFG="nwscanmode",0,1', wait=1.0)
+        # Scan sequence: LTE first, then GSM (covers both LTE and GPRS fallback)
+        self._at('AT+QCFG="nwscanseq",010203,1', wait=1.0)
+
+        log.info('Waiting for network registration (up to 60s)...')
+        for _ in range(30):
+            resp = self._at('AT+CEREG?', wait=1.0)
+            # +CEREG: 0,1 = registered home, 0,5 = registered roaming
+            if ',1' in resp or ',5' in resp:
+                log.info('LTE registered')
+                return True
+            # Also check GSM registration
+            resp2 = self._at('AT+CREG?', wait=1.0)
+            if ',1' in resp2 or ',5' in resp2:
+                log.info('GSM registered')
+                return True
+            time.sleep(2)
+
+        log.warning('Modem not registered after 60s')
+        return False
+
     def _apply(self, apn: str, pdp: str, carrier: str, source: str):
         if self._cfg_apn:          # honour explicit config APN
             apn = self._cfg_apn
@@ -158,6 +187,9 @@ class ModemManager:
             return True
         if not self._carrier_detected:
             self._detect_carrier()
+        if not self._init_modem():
+            log.warning("Modem not registered — PPP dial skipped")
+            return False
         return self._start_ppp()
 
     # ── PPP ───────────────────────────────────────────────────────────────────
