@@ -1,0 +1,42 @@
+#!/bin/sh
+# /etc/init.d/S80trafficcam — traffic camera pipeline service
+
+NAME="trafficcam"
+PIDFILE="/var/run/trafficcam.pid"
+LOGFILE="/var/log/trafficcam.log"
+PYTHON="/usr/bin/python3"
+SCRIPT="/opt/trafficcam/main.py"
+
+export TZ="Asia/Kolkata"
+export LD_LIBRARY_PATH="/oem/usr/lib:/usr/lib:${LD_LIBRARY_PATH}"
+export SSL_CERT_FILE="/usr/lib/python3.11/site-packages/certifi/cacert.pem"
+
+do_start() {
+    echo "Starting $NAME..."
+    mkdir -p /var/trafficcam/raw /var/trafficcam/processed /var/trafficcam/queue
+    start-stop-daemon -S -b -m -p "$PIDFILE" \
+        --exec "$PYTHON" -- "$SCRIPT" >> "$LOGFILE" 2>&1
+    echo "$NAME started (PID $(cat $PIDFILE 2>/dev/null))"
+}
+
+do_stop() {
+    echo "Stopping $NAME..."
+    echo V > /dev/watchdog 2>/dev/null || true
+    killall trafficcam_recorder_new trafficcam_recorder 2>/dev/null || true
+    start-stop-daemon -K -p "$PIDFILE" --retry TERM/10/KILL/5 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "$NAME stopped"
+}
+
+case "$1" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; do_start ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+            echo "$NAME is running (PID $(cat $PIDFILE))"
+        else
+            echo "$NAME is not running"; exit 1
+        fi ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

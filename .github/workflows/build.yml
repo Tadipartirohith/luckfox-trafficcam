@@ -1,0 +1,86 @@
+name: Build & Publish Firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'overlay/**'
+      - 'recorder/**'
+      - 'config/**'
+      - 'build/build_overlay.sh'
+  workflow_dispatch:     # allow manual trigger
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install AWS CLI
+        run: |
+          pip install awscli --quiet
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Download base partition images from S3
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          mkdir -p /tmp/base_images /tmp/firmware-out
+          echo "Downloading base partitions from s3://${{ secrets.S3_BUCKET_FIRMWARE }}/base/"
+          aws s3 sync s3://${{ secrets.S3_BUCKET_FIRMWARE }}/base/ /tmp/base_images/ --region ${{ secrets.AWS_REGION }}
+
+      - name: Restore Luckfox SDK from S3 cache
+        run: |
+          echo "Restoring SDK build cache..."
+          CACHE_TAR=/tmp/sdk_cache.tar.zst
+          aws s3 cp s3://${{ secrets.S3_BUCKET_FIRMWARE }}/sdk-cache/luckfox-sdk-cache.tar.zst $CACHE_TAR \
+            --region ${{ secrets.AWS_REGION }} || true
+          if [ -f "$CACHE_TAR" ]; then
+            echo "Extracting SDK cache (~5GB, takes a few minutes)..."
+            mkdir -p /root/trafficcam_build
+            tar --use-compress-program=zstd -xf $CACHE_TAR -C /
+            echo "SDK cache restored"
+          else
+            echo "No SDK cache found — first build will take longer"
+            echo "Run build/build_full.sh locally and push cache to S3 first"
+            exit 1
+          fi
+
+      - name: Build overlay firmware
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION:            ${{ secrets.AWS_REGION }}
+          S3_BUCKET:             ${{ secrets.S3_BUCKET }}
+          OUT_DIR:               /tmp/firmware-out
+          SDK_DIR:               /root/trafficcam_build/luckfox-pico
+        run: |
+          chmod +x build/build_overlay.sh
+          bash build/build_overlay.sh
+
+      - name: Upload firmware to S3
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION:            ${{ secrets.AWS_REGION }}
+          S3_BUCKET_FIRMWARE:    ${{ secrets.S3_BUCKET_FIRMWARE }}
+          OUT_DIR:               /tmp/firmware-out
+        run: |
+          chmod +x build/upload_s3.sh
+          bash build/upload_s3.sh
+
+      - name: Summary
+        run: |
+          echo "### Firmware Published" >> $GITHUB_STEP_SUMMARY
+          DATE=$(date +%Y-%m-%d)
+          echo "**Image:** \`luckfox-trafficcam-${DATE}.img\`" >> $GITHUB_STEP_SUMMARY
+          echo "**S3:** \`s3://${{ secrets.S3_BUCKET_FIRMWARE }}/${DATE}/\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Flash:** Download \`flash.ps1\` from the same S3 path and run as admin" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,54 @@
+{
+  "server": {
+    "provider": "s3",
+    "aws_access_key_id": "${AWS_ACCESS_KEY_ID}",
+    "aws_secret_access_key": "${AWS_SECRET_ACCESS_KEY}",
+    "aws_region": "${AWS_REGION}",
+    "s3_bucket": "${S3_BUCKET}",
+    "s3_prefix": "trafficcam",
+    "max_retries": 3,
+    "multipart_threshold_mb": 8
+  },
+  "camera": {
+    "device": "/dev/video0",
+    "resolution": "1920x1080",
+    "fps": 30,
+    "chunk_duration_seconds": 60,
+    "bitrate_kbps": 4000,
+    "vi_channel": 0
+  },
+  "detection": {
+    "vehicle_model_path": "/opt/trafficcam/models/vehicle.rknn",
+    "plate_model_path": "/opt/trafficcam/models/plate.rknn",
+    "sample_every_n_seconds": 2,
+    "vehicle_confidence": 0.5,
+    "plate_confidence": 0.4,
+    "input_size": [640, 640]
+  },
+  "storage": {
+    "raw_dir": "/var/trafficcam/raw",
+    "processed_dir": "/var/trafficcam/processed",
+    "upload_queue_dir": "/var/trafficcam/queue",
+    "cleanup_after_upload": true
+  },
+  "gps": {
+    "device": "/dev/ttyS3",
+    "baud_rate": 9600,
+    "no_fix_timeout_seconds": 300
+  },
+  "modem": {
+    "device": "/dev/ttyS4",
+    "baud_rate": 115200,
+    "apn": "",
+    "ppp_user": "",
+    "ppp_password": "",
+    "connect_timeout_seconds": 60
+  },
+  "health": {
+    "max_temp_celsius": 85.0,
+    "min_free_sd_gb": 0.5,
+    "watchdog_interval_seconds": 15,
+    "health_check_interval_seconds": 30,
+    "connectivity_retry_interval_seconds": 60
+  }
+}

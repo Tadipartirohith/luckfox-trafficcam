@@ -1,0 +1,23 @@
+#!/bin/sh
+# /etc/init.d/S60ispserver — rkaiq_3A_server ISP daemon
+# Must start BEFORE S80trafficcam so the VI channel is ready for the recorder.
+
+RKAIQ=/oem/usr/bin/rkaiq_3A_server
+IQPATH=/oem/usr/share/iqfiles
+PIDFILE=/var/run/rkaiq_3A_server.pid
+
+case "$1" in
+    start)
+        [ -f "$RKAIQ" ] || { echo "rkaiq_3A_server not found"; exit 0; }
+        echo "Starting rkaiq_3A_server..."
+        RKISP_AIQ_IQ_PATH="$IQPATH" "$RKAIQ" --silent &
+        echo $! > "$PIDFILE"
+        ;;
+    stop)
+        [ -f "$PIDFILE" ] && kill "$(cat $PIDFILE)" 2>/dev/null || true
+        rm -f "$PIDFILE"
+        killall rkaiq_3A_server 2>/dev/null || true
+        ;;
+    restart) "$0" stop; sleep 1; "$0" start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

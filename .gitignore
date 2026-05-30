@@ -1,0 +1,10 @@
+# Never commit real secrets
+overlay/opt/trafficcam/config.json
+
+# Build artifacts
+*.img
+*.tar.zst
+/tmp/
+__pycache__/
+*.pyc
+*.pyo
