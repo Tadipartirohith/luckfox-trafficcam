@@ -29,10 +29,9 @@ function Wsl-S3Copy {
 
 # Helper: convert a Windows path to WSL /mnt/... path
 function To-WslPath([string]$p) {
-    $p = $p -replace '\\', '/'
-    if ($p -match '^([A-Za-z]):(.*)') {
-        return "/mnt/" + $Matches[1].ToLower() + $Matches[2]
-    }
+    # Convert C:\path\to\file -> /mnt/c/path/to/file
+    $p = $p -replace '\\', '/'          # backslash to forward slash
+    $p = $p -replace '^([A-Za-z]):', { '/mnt/' + $_.Groups[1].Value.ToLower() }
     return $p
 }
 
