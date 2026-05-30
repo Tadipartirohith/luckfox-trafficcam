@@ -207,18 +207,18 @@ class ModemManager:
 
             # Build chat dial command with correct PDP type
             # Jio needs IPV4V6; Airtel/others need IP
-                        # Two-phase chat: Phase 1 (no ABORTs) absorbs the unsolicited NO CARRIER
-            # that EC200U emits when pppd toggles DTR on serial open.
-            # Phase 2 does the real dial with full ABORT handling.
-            p1 = "/usr/sbin/chat -t 3 \"\" \"\" \"\" \"\""
-            p2 = (
+                                    # BusyBox chat exits 3 after CONNECT — pppd treats non-zero as failure
+            # and never starts LCP. Wrap with "|| true" to force exit 0.
+            # ABORT "NO CARRIER" removed: DTR toggle on port open fires it before
+            # the real dial, causing spurious abort (EC200U known quirk).
+            dial_cmd = (
                 f"/usr/sbin/chat -v -t 60 "
-                f"ABORT BUSY ABORT ERROR ABORT \"NO CARRIER\" "
+                f"ABORT BUSY ABORT ERROR "
                 f"\"\" ATZ "
                 f"OK \"AT+CGDCONT=1,\\\"{pdp}\\\",\\\"{apn}\\\"\" "
                 f"OK ATD*99# CONNECT \"\""
             )
-            chat = f"'/bin/sh -c \"{p1}; {p2}\"'"
+            chat = f"'/bin/sh -c \"{dial_cmd} || true\"'"
 
 
             peer_conf = (
