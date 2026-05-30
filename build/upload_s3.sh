@@ -12,10 +12,11 @@ REPO_ROOT=$(dirname "$0")/..
 DDMMYY=$(date +%d%m%y)   # e.g. 310526 for 31 May 2026
 
 # List all existing folders for today, find the highest V number
+# grep exits 1 when no match — || true keeps pipefail happy
 EXISTING_MAX=$(aws s3 ls "s3://$BUCKET/" --region "$REGION" 2>/dev/null \
     | grep -oE "${DDMMYY}_V[0-9]+" \
     | grep -oE "[0-9]+$" \
-    | sort -n | tail -1)
+    | sort -n | tail -1 || true)
 
 if [ -z "$EXISTING_MAX" ]; then
     NEXT_V=1
