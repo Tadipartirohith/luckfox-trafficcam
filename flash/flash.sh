@@ -1,6 +1,8 @@
 #!/bin/bash
 # flash.sh — Flash Luckfox Pico Ultra on Linux/Mac via rkdeveloptool
+# Auto-downloads the latest firmware from S3 (versioned as DDMMYY_VN).
 # Usage: ./flash.sh [/path/to/image.img]
+#        VERSION=310526_V2 ./flash.sh      (specific version from S3)
 set -euo pipefail
 
 TOOL=${RKDEV_TOOL:-rkdeveloptool}
@@ -12,14 +14,21 @@ mkdir -p "$FLASH_DIR"
 IMG=${1:-""}
 
 if [ -z "$IMG" ]; then
-    echo "=== Fetching latest firmware from S3 ==="
-    LATEST=$(aws s3 cp "s3://$S3_BUCKET/latest.txt" - --region $REGION 2>/dev/null | tr -d '[:space:]')
-    [ -z "$LATEST" ] && { echo "ERROR: Cannot reach S3. Pass image path as argument."; exit 1; }
-    IMG_NAME="luckfox-trafficcam-${LATEST}.img"
+    echo "=== Fetching firmware from S3 ==="
+    if [ -n "${VERSION:-}" ]; then
+        FOLDER="$VERSION"
+    else
+        FOLDER=$(aws s3 cp "s3://$S3_BUCKET/latest.txt" - \
+                     --region "$REGION" 2>/dev/null | tr -d '[:space:]')
+        [ -z "$FOLDER" ] && { echo "ERROR: Cannot reach S3. Pass image path or set VERSION="; exit 1; }
+    fi
+    echo "Version: $FOLDER"
+    IMG_NAME="luckfox-trafficcam-${FOLDER}.img"
     IMG="$FLASH_DIR/$IMG_NAME"
     if [ ! -f "$IMG" ]; then
         echo "Downloading $IMG_NAME ..."
-        aws s3 cp "s3://$S3_BUCKET/$LATEST/$IMG_NAME" "$IMG" --region $REGION --no-progress
+        aws s3 cp "s3://$S3_BUCKET/$FOLDER/$IMG_NAME" "$IMG" \
+            --region "$REGION" --no-progress
     else
         echo "Using cached: $IMG"
     fi
@@ -34,7 +43,6 @@ echo "    3. Plug USB-C while holding BOOT"
 echo "    4. Release BOOT after 2-3 seconds"
 echo ""
 
-# Wait for device
 for i in $(seq 1 30); do
     if $TOOL ld 2>/dev/null | grep -q "Loader\|Maskrom"; then
         echo "Device found."
