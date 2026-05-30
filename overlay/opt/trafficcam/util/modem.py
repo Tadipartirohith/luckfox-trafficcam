@@ -137,7 +137,7 @@ class ModemManager:
         # EC200U-CN ships with nwscanmode=3 (LTE only) which prevents 2G fallback
         self._at('AT+QCFG="nwscanmode",0,1', wait=1.0)
         # Scan sequence: LTE first, then GSM (covers both LTE and GPRS fallback)
-        self._at('AT+QCFG="nwscanseq",010203,1', wait=1.0)
+        # nwscanseq not set: EC200U-CN uses manufacturer default order with nwscanmode=0
 
         log.info('Waiting for network registration (up to 60s)...')
         for _ in range(30):
@@ -207,16 +207,23 @@ class ModemManager:
 
             # Build chat dial command with correct PDP type
             # Jio needs IPV4V6; Airtel/others need IP
-            chat = (
-                f"'/usr/sbin/chat -v -t 60 "
+                        # Two-phase chat: Phase 1 (no ABORTs) absorbs the unsolicited NO CARRIER
+            # that EC200U emits when pppd toggles DTR on serial open.
+            # Phase 2 does the real dial with full ABORT handling.
+            p1 = "/usr/sbin/chat -t 3 \"\" \"\" \"\" \"\""
+            p2 = (
+                f"/usr/sbin/chat -v -t 60 "
                 f"ABORT BUSY ABORT ERROR ABORT \"NO CARRIER\" "
                 f"\"\" ATZ "
                 f"OK \"AT+CGDCONT=1,\\\"{pdp}\\\",\\\"{apn}\\\"\" "
-                f"OK ATD*99# CONNECT \"\"'"
+                f"OK ATD*99# CONNECT \"\""
             )
+            chat = f"'/bin/sh -c \"{p1}; {p2}\"'"
+
 
             peer_conf = (
                 'noauth\ndefaultroute\nusepeerdns\nnoipdefault\n'
+                'nocrtscts\nlocal\n'  # UART4 has no RTS/CTS wiring
             )
             # Jio dual-stack: enable IPv6 in pppd
             if pdp == 'IPV4V6':
