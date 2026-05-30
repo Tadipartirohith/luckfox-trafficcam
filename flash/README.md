@@ -11,9 +11,10 @@ Install these on your Windows machine before flashing:
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| **AWS CLI** | Download firmware from S3 | `winget install Amazon.AWSCLI` or [aws.amazon.com/cli](https://aws.amazon.com/cli/) |
 | **usbipd-win** | Pass USB device to WSL2 | `winget install usbipd` or [github.com/dorssel/usbipd-win](https://github.com/dorssel/usbipd-win) |
-| **WSL2 Ubuntu-22.04** | Runs the Luckfox upgrade tool | `wsl --install -d Ubuntu-22.04` |
+| **WSL2 Ubuntu-22.04** | Runs the Luckfox upgrade tool and downloads from S3 | `wsl --install -d Ubuntu-22.04` |
+
+> **No Windows AWS CLI needed.** `flash.ps1` routes all S3 downloads through WSL2, which already has `awscli` installed and credentials configured.
 
 WSL2 must have the Luckfox SDK at `/root/trafficcam_build/luckfox-pico/` (the upgrade tool lives inside it).
 
@@ -26,9 +27,9 @@ WSL2 must have the Luckfox SDK at `/root/trafficcam_build/luckfox-pico/` (the up
 Open any PowerShell window (does not need to be admin yet):
 
 ```powershell
-# Always downloads the latest version
-$v = (aws s3 cp s3://luckfox-firmware-img/latest.txt - --region ap-south-1).Trim()
-aws s3 cp "s3://luckfox-firmware-img/$v/flash.ps1" "$env:USERPROFILE\Desktop\flash.ps1" --region ap-south-1
+# Download flash.ps1 via WSL2 (no Windows AWS CLI required)
+$v = (wsl -d Ubuntu-22.04 -u root -- python3 -m awscli s3 cp s3://luckfox-firmware-img/latest.txt - --region ap-south-1 2>$null).Trim()
+wsl -d Ubuntu-22.04 -u root -- python3 -m awscli s3 cp "s3://luckfox-firmware-img/$v/flash.ps1" "/mnt/c/Users/$env:USERNAME/Desktop/flash.ps1" --region ap-south-1
 Write-Host "Downloaded version: $v"
 ```
 
