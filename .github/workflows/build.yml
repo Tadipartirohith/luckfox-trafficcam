@@ -8,6 +8,7 @@ on:
       - recorder/**
       - config/**
       - build/build_overlay.sh
+      - build/upload_s3.sh
       - flash/**
   workflow_dispatch:
 
