@@ -205,31 +205,45 @@ class ModemManager:
             log.info('Starting PPP: carrier=%s  APN=%s  PDP=%s',
                      self._carrier, apn, pdp)
 
-            # Build chat dial command with correct PDP type
-            # Jio needs IPV4V6; Airtel/others need IP
-                                    # BusyBox chat exits 3 after CONNECT — pppd treats non-zero as failure
-            # and never starts LCP. Wrap with "|| true" to force exit 0.
-            # ABORT "NO CARRIER" removed: DTR toggle on port open fires it before
-            # the real dial, causing spurious abort (EC200U known quirk).
-            dial_cmd = (
-                f"/usr/sbin/chat -v -t 60 "
-                f"ABORT BUSY ABORT ERROR "
-                f"\"\" ATZ "
-                f"OK \"AT+CGDCONT=1,\\\"{pdp}\\\",\\\"{apn}\\\"\" "
-                f"OK ATD*99# CONNECT \"\""
-            )
-            chat = f"'/bin/sh -c \"{dial_cmd} || true\"'"
+            # Write connect script to a file to avoid shell quoting issues
+            # with inline connect directives in the pppd peer file.
+            # BusyBox chat exits 3 after CONNECT (not 0); "|| exit 0" fixes that
+            # so pppd proceeds to LCP negotiation.
+            chat_lines = [
+                '#!/bin/sh',
+                '/usr/sbin/chat -v -t 60 \',
+                '  ABORT BUSY ABORT ERROR \',
+                "  '' ATZ \",
+                f"  OK 'AT+CGDCONT=1,\"\"{pdp}\"\",\"\"{apn}\"\"' \\",
+                '  OK ATD*99# \',
+                "  CONNECT '' || exit 0",
+            ]
 
+            # Build chat script without any escaping tricks
+            cgdcont_cmd = f"AT+CGDCONT=1,\"{pdp}\",\"{apn}\""
+            chat_script = (
+                "#!/bin/sh\n"
+                "/usr/sbin/chat -v -t 60 \\\n"
+                "  ABORT BUSY ABORT ERROR \\\n"
+                "  '' ATZ \\\n"
+                f"  OK '{cgdcont_cmd}' \\\n"
+                "  OK 'ATD*99#' \\\n"
+                "  CONNECT '' || exit 0\n"
+            )
+
+            with open('/tmp/ppp_chat.sh', 'w') as f:
+                f.write(chat_script)
+            import os as _os
+            _os.chmod('/tmp/ppp_chat.sh', 0o755)
+            log.debug('Chat script written to /tmp/ppp_chat.sh')
 
             peer_conf = (
                 'noauth\ndefaultroute\nusepeerdns\nnoipdefault\n'
-                'nocrtscts\nlocal\n'  # UART4 has no RTS/CTS wiring
+                'nocrtscts\nlocal\n'
             )
-            # Jio dual-stack: enable IPv6 in pppd
             if pdp == 'IPV4V6':
                 peer_conf += '+ipv6\n'
-
-            peer_conf += f'connect {chat}\n'
+            peer_conf += 'connect /tmp/ppp_chat.sh\n'
 
             peer_path = '/tmp/ppp_modem_peer'
             try:
@@ -252,7 +266,6 @@ class ModemManager:
                         return True
                     time.sleep(2)
 
-                # Dual-stack timeout → retry IPv4 only
                 if pdp == 'IPV4V6':
                     log.warning('Dual-stack PPP timed out — retrying IPv4 only')
                     self._stop_ppp()
@@ -266,6 +279,7 @@ class ModemManager:
             except Exception as e:
                 log.error('PPP start failed: %s', e)
                 return False
+
 
     def _stop_ppp(self):
         if self._ppp_proc:
