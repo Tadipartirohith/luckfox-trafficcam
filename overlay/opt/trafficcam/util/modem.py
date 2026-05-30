@@ -14,6 +14,7 @@ IPv4V6 PPP also enables the +ipv6 pppd option for Jio.
 """
 
 import logging
+import datetime
 import re
 import subprocess
 import time
@@ -138,10 +139,17 @@ class ModemManager:
     # ── Connectivity ─────────────────────────────────────────────────────────
 
     def is_online(self) -> bool:
+        """Check connectivity: default route present then lightweight HTTP."""
         try:
-            r = subprocess.run(['ping', '-c', '1', '-W', '3', '8.8.8.8'],
-                               capture_output=True, timeout=5)
-            return r.returncode == 0
+            r = subprocess.run(['ip', 'route', 'show', 'default'],
+                               capture_output=True, timeout=3)
+            if r.returncode != 0 or not r.stdout.strip():
+                return False
+            r2 = subprocess.run(
+                ['wget', '-q', '--timeout=5', '-O', '/dev/null',
+                 'http://checkip.amazonaws.com'],
+                capture_output=True, timeout=8)
+            return r2.returncode == 0
         except Exception:
             return False
 
@@ -231,6 +239,34 @@ class ModemManager:
         self._connected = False
 
     # ── LBS location ─────────────────────────────────────────────────────────
+
+    def sync_time(self) -> bool:
+        """Sync system clock from modem network time (AT+QLTS=2).
+        Response: +QLTS: "YYYY/MM/DD,HH:MM:SS+QQ,dst"  QQ = UTC offset in quarter-hours.
+        """
+        try:
+            resp = self._at('AT+QLTS=2', wait=2.0)
+            m = re.search(
+                r'\+QLTS:\s*"(\d+)/(\d+)/(\d+),(\d+):(\d+):(\d+)([+-]\d+)',
+                resp)
+            if not m:
+                log.debug('AT+QLTS=2 no usable response: %r', resp)
+                return False
+            yr, mo, dy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            hr, mi, sc = int(m.group(4)), int(m.group(5)), int(m.group(6))
+            tz_qh      = int(m.group(7))
+            local_dt   = datetime.datetime(yr, mo, dy, hr, mi, sc)
+            utc_dt     = local_dt - datetime.timedelta(minutes=tz_qh * 15)
+            epoch      = int(utc_dt.timestamp())
+            result     = subprocess.run(['date', '-u', '-s', f'@{epoch}'],
+                                        capture_output=True, timeout=5)
+            if result.returncode == 0:
+                log.info('Clock synced via modem AT+QLTS: %s UTC', utc_dt.isoformat())
+                return True
+            log.warning('date -s failed: %s', result.stderr.decode())
+        except Exception as e:
+            log.warning('sync_time error: %s', e)
+        return False
 
     def get_location(self) -> Tuple[Optional[float], Optional[float]]:
         """Cell-tower LBS via AT+CLBS (only when PPP not active)."""

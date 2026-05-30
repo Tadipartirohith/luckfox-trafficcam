@@ -60,9 +60,10 @@ sed -e "s|\${AWS_ACCESS_KEY_ID}|${AWS_ACCESS_KEY_ID:-}|g" \
     > "$ROOTFS/opt/trafficcam/config.json"
 
 # Init scripts
-cp "$OVERLAY/etc/init.d/S80trafficcam" "$ROOTFS/etc/init.d/S80trafficcam"
+cp "$OVERLAY/etc/init.d/S41clocksync"  "$ROOTFS/etc/init.d/S41clocksync"
 cp "$OVERLAY/etc/init.d/S60ispserver"  "$ROOTFS/etc/init.d/S60ispserver"
-chmod +x "$ROOTFS/etc/init.d/S80trafficcam" "$ROOTFS/etc/init.d/S60ispserver"
+cp "$OVERLAY/etc/init.d/S80trafficcam" "$ROOTFS/etc/init.d/S80trafficcam"
+chmod +x "$ROOTFS/etc/init.d/S41clocksync"          "$ROOTFS/etc/init.d/S60ispserver"          "$ROOTFS/etc/init.d/S80trafficcam"
 
 # RkLunch.sh (OEM partition)
 OEM=$SDK/output/out/oem

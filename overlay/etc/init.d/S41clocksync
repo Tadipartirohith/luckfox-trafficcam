@@ -1,0 +1,44 @@
+#!/bin/sh
+# /etc/init.d/S41clocksync — sync system clock at boot via NTP
+# Retries in background so it works even if USB network takes a few seconds.
+# Also called by modem.py after PPP connects (sync via cellular time).
+
+NTP_SERVERS="time.cloudflare.com pool.ntp.org time.google.com 216.239.35.0"
+LOG=/tmp/clocksync.log
+MAX_RETRIES=18
+RETRY_SECS=10
+
+do_sync() {
+    for srv in $NTP_SERVERS; do
+        if rdate -n "$srv" 2>>"$LOG"; then
+            echo "$(date): synced via $srv" >> "$LOG"
+            return 0
+        fi
+    done
+    return 1
+}
+
+case "$1" in
+    start)
+        echo "Syncing clock (NTP)..."
+        if do_sync; then
+            echo "Clock sync OK: $(date)"
+        else
+            echo "No network yet — retrying in background..."
+            (
+                n=0
+                while [ "$n" -lt "$MAX_RETRIES" ]; do
+                    sleep "$RETRY_SECS"
+                    if do_sync; then
+                        echo "Deferred clock sync OK: $(date)"
+                        exit 0
+                    fi
+                    n=$((n + 1))
+                done
+                echo "$(date): clock sync gave up after $((MAX_RETRIES * RETRY_SECS))s" >> "$LOG"
+            ) &
+        fi
+        ;;
+    stop) ;;
+    *) echo "Usage: $0 {start|stop}" ;;
+esac
