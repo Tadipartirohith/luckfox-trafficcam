@@ -14,6 +14,12 @@ export SSL_CERT_FILE="/usr/lib/python3.11/site-packages/certifi/cacert.pem"
 do_start() {
     echo "Starting $NAME..."
     mkdir -p /var/trafficcam/raw /var/trafficcam/processed /var/trafficcam/queue
+    # Add default route via USB0 (laptop/hub NAT) if no default route exists yet.
+    # In production this is a no-op when PPP brings up the default route instead.
+    if ! ip route show | grep -q '^default'; then
+        route add default gw 172.32.0.100 dev usb0 2>/dev/null || true
+        echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+    fi
     start-stop-daemon -S -b -m -p "$PIDFILE" \
         --exec "$PYTHON" -- "$SCRIPT" >> "$LOGFILE" 2>&1
     echo "$NAME started (PID $(cat $PIDFILE 2>/dev/null))"
