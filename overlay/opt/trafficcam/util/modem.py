@@ -128,6 +128,13 @@ class ModemManager:
             self._carrier_detected = True
 
 
+    def _post_register_init(self):
+        """Quectel EC200U forum-confirmed prep sequence before PPP dial."""
+        self._at('ATE0', wait=0.5)             # disable echo for cleaner chat
+        self._at('AT+CGATT=1', wait=2.0)       # explicit GPRS attach
+        r = self._at('AT+CGACT=1,1', wait=3.0) # activate PDP context (EC200U-CN Airtel confirmed)
+        log.debug('CGACT result: %s', r.strip())
+
     def _init_modem(self) -> bool:
         """Set modem to auto network mode and wait for registration.
         Must be called before PPP dial. Returns True when registered."""
@@ -145,11 +152,13 @@ class ModemManager:
             # +CEREG: 0,1 = registered home, 0,5 = registered roaming
             if ',1' in resp or ',5' in resp:
                 log.info('LTE registered')
+                self._post_register_init()
                 return True
             # Also check GSM registration
             resp2 = self._at('AT+CREG?', wait=1.0)
             if ',1' in resp2 or ',5' in resp2:
                 log.info('GSM registered')
+                self._post_register_init()
                 return True
             time.sleep(2)
 
@@ -221,20 +230,25 @@ class ModemManager:
 
             # Build chat script without any escaping tricks
             cgdcont_cmd = f"AT+CGDCONT=1,\"{pdp}\",\"{apn}\""
-            chat_script = (
-                "#!/bin/sh\n"
-                "/usr/sbin/chat -v -t 60 \\\n"
-                "  ABORT BUSY ABORT ERROR \\\n"
-                "  '' ATZ \\\n"
-                f"  OK '{cgdcont_cmd}' \\\n"
-                "  OK 'ATD*99#' \\\n"
-                "  CONNECT '' || exit 0\n"
+            # Chat script in -f file format (official Quectel EC200U sequence).
+            # Using -f avoids all shell quoting ambiguity with inline args.
+            # Sequence: AT echo -> ATE0 -> CGDCONT -> ATD*99# -> CONNECT
+            cgdcont = f'AT+CGDCONT=1,\"{pdp}\",\"{apn}\"'
+            chat_conf = (
+                "ABORT 'BUSY'\n"
+                "ABORT 'NO CARRIER'\n"
+                "ABORT 'ERROR'\n"
+                "TIMEOUT 60\n"
+                "'' AT\n"
+                "OK ATE0\n"
+                f"OK '{cgdcont}'\n"
+                "OK 'ATD*99#'\n"
+                "CONNECT ''\n"
             )
-
-            with open('/tmp/ppp_chat.sh', 'w') as f:
-                f.write(chat_script)
+            with open('/tmp/ppp_chat.conf', 'w') as f:
+                f.write(chat_conf)
             import os as _os
-            _os.chmod('/tmp/ppp_chat.sh', 0o755)
+            _os.chmod('/tmp/ppp_chat.conf', 0o644)
             log.debug('Chat script written to /tmp/ppp_chat.sh')
 
             peer_conf = (
@@ -243,7 +257,7 @@ class ModemManager:
             )
             if pdp == 'IPV4V6':
                 peer_conf += '+ipv6\n'
-            peer_conf += 'connect /tmp/ppp_chat.sh\n'
+            peer_conf += f'connect "/usr/sbin/chat -v -f /tmp/ppp_chat.conf"\n'
 
             peer_path = '/tmp/ppp_modem_peer'
             try:
@@ -258,7 +272,8 @@ class ModemManager:
                     ['pppd', self._device, str(self._baud), 'file', peer_path],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
-                deadline = time.time() + self._connect_timeout
+                # Quectel docs: IPCP can take 90s; ensure at least 120s total
+                deadline = time.time() + max(self._connect_timeout, 120)
                 while time.time() < deadline:
                     if self.is_online():
                         log.info('PPP connected (APN=%s, %s)', apn, pdp)
