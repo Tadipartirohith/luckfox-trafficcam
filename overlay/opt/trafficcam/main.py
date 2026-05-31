@@ -37,43 +37,31 @@ log = logging.getLogger("main")
 CONFIG_PATH = "/opt/trafficcam/config.json"
 
 
-def _ntp_sync() -> bool:
-    """Try rdate NTP sync — used at startup before modem connects."""
-    import subprocess as _sp
-    for srv in ('time.cloudflare.com', 'pool.ntp.org', 'time.google.com'):
-        try:
-            r = _sp.run(['rdate', '-n', srv], capture_output=True, timeout=10)
-            if r.returncode == 0:
-                log.info('Clock synced via NTP (%s)', srv)
-                return True
-        except Exception:
-            pass
-    return False
-
-
 async def _modem_loop(modem: ModemManager):
-    """Dial modem at startup and sync clock whenever connectivity is restored."""
+    """
+    Dial the 4G modem at startup and sync the clock once after first connection.
+    Without this, the modem only dials when the uploader has a file to
+    upload — but if the camera has never produced a file the modem never
+    comes online.  This loop fixes that chicken-and-egg problem.
+    """
+    await asyncio.sleep(8)          # let GPS / health initialise first
     loop = asyncio.get_running_loop()
-
-    # Try NTP immediately via laptop USB internet (succeeds if laptop is attached)
-    await asyncio.sleep(5)
-    if not await loop.run_in_executor(None, _ntp_sync):
-        log.info('NTP not yet reachable — will sync via modem after PPP connects')
-
-    await asyncio.sleep(3)
-    _clock_synced = False
+    _time_synced = False
     while True:
-        if not modem.is_online():
-            log.info('main: internet offline — dialling modem …')
+        connected = modem.is_online()
+        if not connected:
+            log.info("main: internet offline — dialling modem …")
             try:
-                ok = await loop.run_in_executor(None, modem.ensure_connected)
-                if ok and not _clock_synced:
-                    synced = await loop.run_in_executor(None, modem.sync_time)
-                    if synced:
-                        _clock_synced = True
+                connected = await loop.run_in_executor(None, modem.ensure_connected)
             except Exception as e:
-                log.warning('main: modem dial error: %s', e)
-        await asyncio.sleep(60)
+                log.warning("main: modem dial error: %s", e)
+        if connected and not _time_synced:
+            try:
+                await loop.run_in_executor(None, modem.sync_time)
+                _time_synced = True
+            except Exception as e:
+                log.warning("main: sync_time error: %s", e)
+        await asyncio.sleep(60)     # re-check every minute
 
 
 async def main():

@@ -1,20 +1,24 @@
 """
-util/modem.py  —  Quectel EC200U + carrier auto-detection.
+util/modem.py  —  Quectel EC200U carrier + AT-command bearer management.
 
-Reads SIM carrier from IMSI (AT+CIMI) or operator name (AT+COPS), then sets:
-  Jio    → APN = "jionet"          PDP type = "IPV4V6"  (Jio is IPv6-only on 4G)
-  Airtel → APN = "airtelgprs.com"  PDP type = "IP"      (Airtel is IPv4)
-  Vi     → APN = "www.viphone.co.in" PDP type = "IP"
-  BSNL   → APN = "bsnlnet"         PDP type = "IP"
-  Unknown→ uses config apn with "IP"
+PPP over UART is NOT used: after ATD*99# the EC200U-CN goes completely silent
+on the UART (even LCP echo gets no response).  Instead we:
+  1. Activate the PDP bearer with AT+CGACT=1,1  → real internet IP
+  2. Check connectivity with AT+QPING
+  3. Upload files via AT+QHTTPPUT with pre-signed S3 URLs
+  4. Sync time via AT+QLTS=2
 
-If config.json sets a non-empty apn, that APN is used but the PDP type
-(IP vs IPV4V6) is still auto-detected from the SIM card.
-IPv4V6 PPP also enables the +ipv6 pppd option for Jio.
+All HTTP operations keep ONE serial port open for the entire command sequence
+(QHTTPCFG → QHTTPURL → QHTTPPUT) to avoid modem state-machine issues from
+repeatedly opening/closing the port.  A reentrant lock (RLock) serialises
+all serial-port access so the modem loop and the uploader thread don't race.
+
+UART throughput at 115200 baud ≈ 11 KB/s.  Large video uploads should be
+queued and deferred; small files (<500 KB) upload in ~45 s.
 """
 
-import logging
 import datetime
+import logging
 import re
 import subprocess
 import time
@@ -26,7 +30,6 @@ import serial
 log = logging.getLogger(__name__)
 
 # ── Carrier database ──────────────────────────────────────────────────────
-# IMSI prefix (first 5-6 digits = MCC+MNC) → (apn, pdp_type, name)
 _PLMN = {
     '40440': ('jionet',             'IPV4V6', 'Jio'),
     '40450': ('jionet',             'IPV4V6', 'Jio'),
@@ -54,49 +57,89 @@ _NAME = {
     'bsnl':     ('bsnlnet',           'IP',     'BSNL'),
 }
 
+_SSL_CTX = 1          # Quectel SSL context index used for all HTTPS calls
+_HTTP_GET_TIMEOUT = 60  # seconds for GET operations
+
 
 class ModemManager:
     def __init__(self, config: dict):
         mdm = config['modem']
-        self._device          = mdm.get('device', '/dev/ttyS4')
-        self._baud            = int(mdm.get('baud_rate', 115200))
-        self._cfg_apn         = mdm.get('apn', '').strip()
-        self._ppp_user        = mdm.get('ppp_user', '')
-        self._ppp_password    = mdm.get('ppp_password', '')
-        self._connect_timeout = int(mdm.get('connect_timeout_seconds', 60))
-        self._ppp_proc        = None
-        self._connected       = False
-        self._lock            = threading.Lock()
+        self._device           = mdm.get('device', '/dev/ttyS4')
+        self._baud             = int(mdm.get('baud_rate', 115200))
+        self._cfg_apn          = mdm.get('apn', '').strip()
+        self._connect_timeout  = int(mdm.get('connect_timeout_seconds', 60))
+        # RLock: reentrant so http_put (which holds lock) can call _at (which also locks)
+        self._lock             = threading.RLock()
+        self._bearer_active    = False
 
-        # Resolved at first connect attempt
-        self._apn             = self._cfg_apn or 'airtelgprs.com'  # safe default
-        self._pdp_type        = 'IP'
-        self._carrier         = 'unknown'
+        self._apn              = self._cfg_apn or 'airtelgprs.com'
+        self._pdp_type         = 'IP'
+        self._carrier          = 'unknown'
         self._carrier_detected = False
 
     def start(self):
         log.info('ModemManager ready (device: %s, APN: auto-detect pending)',
                  self._device)
 
-    # ── AT helper ────────────────────────────────────────────────────────────
+    # ── AT helper (opens/closes port per command) ─────────────────────────────
 
-    def _at(self, cmd: str, wait: float = 1.0) -> str:
-        try:
-            with serial.Serial(self._device, self._baud, timeout=5) as s:
-                s.reset_input_buffer()
-                s.write((cmd + '\r\n').encode())
-                time.sleep(wait)
-                return s.read(512).decode(errors='ignore')
-        except Exception as e:
-            log.debug('AT %s failed: %s', cmd, e)
-            return ''
+    def _at(self, cmd: str, wait: float = 1.0, bufsize: int = 512) -> str:
+        """Send AT command; poll for response.  Acquires _lock (RLock)."""
+        with self._lock:
+            try:
+                with serial.Serial(self._device, self._baud, timeout=2.0) as s:
+                    s.reset_input_buffer()
+                    s.write((cmd + '\r\n').encode())
+                    if wait <= 3.0:
+                        time.sleep(wait)
+                        return s.read(bufsize).decode(errors='ignore')
+                    buf = bytearray()
+                    deadline = time.time() + wait
+                    while time.time() < deadline:
+                        chunk = s.read(min(bufsize - len(buf), 512))
+                        if chunk:
+                            buf.extend(chunk)
+                            text = bytes(buf)
+                            if (b'\r\nOK\r\n' in text or b'\r\nERROR\r\n' in text
+                                    or b'+CME ERROR' in text
+                                    or b'+QHTTPGET:' in text
+                                    or b'+QHTTPREAD:' in text
+                                    or b'+QPING:' in text
+                                    or b'CONNECT\r\n' in text):
+                                break
+                        else:
+                            time.sleep(0.1)
+                    return bytes(buf).decode(errors='ignore')
+            except Exception as e:
+                log.debug('AT %s failed: %s', cmd, e)
+                return ''
 
-    # ── Carrier detection ─────────────────────────────────────────────────
+    # ── AT helper (uses already-open port, no lock) ───────────────────────────
+
+    @staticmethod
+    def _scmd(s, cmd: str, wait_for: str = None, timeout: float = 8.0) -> str:
+        """Send AT command on an open serial port; wait for expected string or timeout.
+        Called from within methods that already hold _lock and have s open."""
+        s.reset_input_buffer()
+        s.write((cmd + '\r\n').encode())
+        buf = b''
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = s.read(256)
+            if chunk:
+                buf += chunk
+                text = buf
+                if wait_for and wait_for.encode() in text:
+                    break
+                if (b'\r\nOK\r\n' in text or b'\r\nERROR\r\n' in text
+                        or b'+CME ERROR' in text or b'+CMS ERROR' in text):
+                    break
+        return buf.decode(errors='ignore')
+
+    # ── Carrier detection ─────────────────────────────────────────────────────
 
     def _detect_carrier(self):
-        """Probe SIM via AT commands; update self._apn / _pdp_type / _carrier."""
         try:
-            # 1. IMSI → PLMN prefix lookup
             resp = self._at('AT+CIMI', wait=2.0)
             m = re.search(r'\n(\d{15})', resp)
             if m:
@@ -107,7 +150,6 @@ class ModemManager:
                         self._apply(*entry, f'IMSI {imsi[:plen]}')
                         return
 
-            # 2. Operator name fallback
             resp = self._at('AT+COPS?', wait=2.0)
             m = re.search(r'\+COPS:\s*\d+,\d+,"([^"]+)"', resp)
             if m:
@@ -117,186 +159,230 @@ class ModemManager:
                         self._apply(*entry, f'operator "{m.group(1)}"')
                         return
 
-            # 3. Config APN fallback
             apn = self._cfg_apn or 'airtelgprs.com'
             pdp = 'IPV4V6' if 'jio' in apn.lower() else 'IP'
             self._apply(apn, pdp, 'config-fallback', apn)
-
         except Exception as e:
             log.warning('Carrier detect error: %s', e)
         finally:
             self._carrier_detected = True
 
-
-    def _post_register_init(self):
-        """Quectel EC200U forum-confirmed prep sequence before PPP dial."""
-        self._at('ATE0', wait=0.5)             # disable echo for cleaner chat
-        self._at('AT+CGATT=1', wait=2.0)       # explicit GPRS attach
-        r = self._at('AT+CGACT=1,1', wait=3.0) # activate PDP context (EC200U-CN Airtel confirmed)
-        log.debug('CGACT result: %s', r.strip())
-
-    def _init_modem(self) -> bool:
-        """Set modem to auto network mode and wait for registration.
-        Must be called before PPP dial. Returns True when registered."""
-        log.info('Initialising modem...')
-
-        # Enable auto network scan (LTE preferred, fallback to GSM/WCDMA)
-        # EC200U-CN ships with nwscanmode=3 (LTE only) which prevents 2G fallback
-        self._at('AT+QCFG="nwscanmode",0,1', wait=1.0)
-        # Scan sequence: LTE first, then GSM (covers both LTE and GPRS fallback)
-        # nwscanseq not set: EC200U-CN uses manufacturer default order with nwscanmode=0
-
-        log.info('Waiting for network registration (up to 60s)...')
-        for _ in range(30):
-            resp = self._at('AT+CEREG?', wait=1.0)
-            # +CEREG: 0,1 = registered home, 0,5 = registered roaming
-            if ',1' in resp or ',5' in resp:
-                log.info('LTE registered')
-                self._post_register_init()
-                return True
-            # Also check GSM registration
-            resp2 = self._at('AT+CREG?', wait=1.0)
-            if ',1' in resp2 or ',5' in resp2:
-                log.info('GSM registered')
-                self._post_register_init()
-                return True
-            time.sleep(2)
-
-        log.warning('Modem not registered after 60s')
-        return False
-
     def _apply(self, apn: str, pdp: str, carrier: str, source: str):
-        if self._cfg_apn:          # honour explicit config APN
+        if self._cfg_apn:
             apn = self._cfg_apn
         self._apn      = apn
         self._pdp_type = pdp
         self._carrier  = carrier
-        log.info('Carrier detected: %s (via %s) → APN=%s  PDP=%s',
-                 carrier, source, apn, pdp)
+        log.info('Carrier: %s (via %s) → APN=%s PDP=%s', carrier, source, apn, pdp)
 
-    # ── Connectivity ─────────────────────────────────────────────────────────
+    # ── Network registration ──────────────────────────────────────────────────
+
+    def _init_modem(self) -> bool:
+        log.info('Initialising modem...')
+        self._at('AT+QCFG="nwscanmode",0,1', wait=1.0)
+        log.info('Waiting for registration (up to 60s)...')
+        for _ in range(30):
+            resp = self._at('AT+CEREG?', wait=1.0)
+            if ',1' in resp or ',5' in resp:
+                log.info('LTE registered')
+                return True
+            resp2 = self._at('AT+CREG?', wait=1.0)
+            if ',1' in resp2 or ',5' in resp2:
+                log.info('GSM registered')
+                return True
+            time.sleep(2)
+        log.warning('Modem not registered after 60s')
+        return False
+
+    # ── Bearer (AT+CGACT) ─────────────────────────────────────────────────────
+
+    def _activate_bearer(self) -> bool:
+        # _lock already held by caller (ensure_connected) or acquired here
+        with self._lock:
+            self._at('AT+CGACT=0,2', wait=3.0)
+
+            r_cfg = self._at(
+                f'AT+CGDCONT=1,"{self._pdp_type}","{self._apn}"', wait=1.5)
+            log.debug('CGDCONT: %s', r_cfg.strip())
+
+            r_act = self._at('AT+CGACT=1,1', wait=8.0)
+            if 'ERROR' in r_act and 'CME ERROR' not in r_act:
+                log.warning('CGACT=1,1 failed: %s', r_act.strip())
+                return False
+
+            r_addr = self._at('AT+CGPADDR=1', wait=2.0)
+            m = re.search(r'\+CGPADDR:\s*1,"([^"]+)"', r_addr)
+            if not m or m.group(1) in ('0.0.0.0', ''):
+                log.warning('Bearer has no IP after CGACT: %s', r_addr.strip())
+                return False
+
+            log.info('Bearer active — device IP: %s', m.group(1))
+            self._bearer_active = True
+            return True
+
+    def is_bearer_active(self) -> bool:
+        r = self._at('AT+CGPADDR=1', wait=2.0)
+        m = re.search(r'\+CGPADDR:\s*1,"([^"]+)"', r)
+        if m and m.group(1) not in ('0.0.0.0', ''):
+            return True
+        self._bearer_active = False
+        return False
+
+    # ── Connectivity ──────────────────────────────────────────────────────────
 
     def is_online(self) -> bool:
-        """Check connectivity: default route present then lightweight HTTP."""
+        """Return True if bearer is up and has an IP address.
+        Skips QPING — Airtel blocks ICMP to 8.8.8.8 on PDP context."""
+        if not self._lock.acquire(blocking=True, timeout=3.0):
+            return self._bearer_active
         try:
-            r = subprocess.run(['ip', 'route', 'show', 'default'],
-                               capture_output=True, timeout=3)
-            if r.returncode != 0 or not r.stdout.strip():
-                return False
-            r2 = subprocess.run(
-                ['wget', '-q', '--timeout=5', '-O', '/dev/null',
-                 'http://checkip.amazonaws.com'],
-                capture_output=True, timeout=8)
-            return r2.returncode == 0
-        except Exception:
-            return False
+            r_addr = self._at('AT+CGPADDR=1', wait=2.0)
+            m = re.search(r'\+CGPADDR:\s*1,"([^"]+)"', r_addr)
+            online = bool(m and m.group(1) not in ('0.0.0.0', ''))
+            self._bearer_active = online
+            return online
+        finally:
+            self._lock.release()
 
     def ensure_connected(self) -> bool:
-        if self.is_online():
+        if self.is_bearer_active():
             return True
         if not self._carrier_detected:
             self._detect_carrier()
         if not self._init_modem():
-            log.warning("Modem not registered — PPP dial skipped")
+            log.warning('Modem not registered — bearer activation skipped')
             return False
-        return self._start_ppp()
+        ok = self._activate_bearer()
+        if ok:
+            self.sync_time()
+        return ok
 
-    # ── PPP ───────────────────────────────────────────────────────────────────
+    # ── AT-command HTTP (single open port, held under _lock) ──────────────────
 
-    def _start_ppp(self) -> bool:
+    def http_get(self, url: str) -> Optional[bytes]:
+        """HTTP(S) GET using modem's embedded client.  Returns body bytes or None."""
         with self._lock:
-            if self._connected:
-                return True
-
-            apn = self._apn
-            pdp = self._pdp_type
-
-            log.info('Starting PPP: carrier=%s  APN=%s  PDP=%s',
-                     self._carrier, apn, pdp)
-
-            # Write chat script in -f scriptfile format.
-            # Official Quectel EC200U sequence (confirmed for Airtel India):
-            #   "" AT -> OK ATE0 -> OK CGDCONT -> OK ATD*99# -> CONNECT
-            # Using -f avoids all shell quoting issues with inline connect args.
-            cgdcont = 'AT+CGDCONT=1,"' + pdp + '","' + apn + '"'
-            chat_conf = (
-                "ABORT 'BUSY'\n"
-                "ABORT 'NO CARRIER'\n"
-                "ABORT 'ERROR'\n"
-                "TIMEOUT 60\n"
-                "'' AT\n"
-                "OK ATE0\n"
-                "OK '" + cgdcont + "'\n"
-                "OK 'ATD*99#'\n"
-                "CONNECT ''\n"
-            )
-            with open('/tmp/ppp_chat.conf', 'w') as f:
-                f.write(chat_conf)
-            import os as _os
-            _os.chmod('/tmp/ppp_chat.conf', 0o644)
-            log.debug('Chat conf:\n%s', chat_conf)
-
-            peer_conf = (
-                'noauth\ndefaultroute\nusepeerdns\nnoipdefault\n'
-                'nocrtscts\nlocal\n'
-            )
-            if pdp == 'IPV4V6':
-                peer_conf += '+ipv6\n'
-            peer_conf += 'connect "/usr/sbin/chat -v -f /tmp/ppp_chat.conf"\n'
-
-            peer_path = '/tmp/ppp_modem_peer'
+            if not self.is_bearer_active():
+                log.warning('http_get: bearer not active')
+                return None
             try:
-                with open(peer_path, 'w') as f:
-                    f.write(peer_conf)
+                with serial.Serial(self._device, self._baud, timeout=2.0) as s:
+                    self._scmd(s, 'AT+QHTTPCFG="contextid",1')
+                    self._scmd(s, 'AT+QHTTPCFG="requestheader",0')
+                    self._scmd(s, 'AT+QHTTPCFG="responseheader",0')
+                    self._scmd(s, f'AT+QSSLCFG="sslversion",{_SSL_CTX},4')
+                    self._scmd(s, f'AT+QSSLCFG="ciphersuite",{_SSL_CTX},0xFFFF')
+                    self._scmd(s, f'AT+QSSLCFG="seclevel",{_SSL_CTX},0')
+                    self._scmd(s, f'AT+QHTTPCFG="sslctxid",{_SSL_CTX}')
+
+                    r = self._scmd(s, f'AT+QHTTPURL={len(url)},30',
+                                   wait_for='CONNECT', timeout=12)
+                    if 'CONNECT' not in r:
+                        log.warning('http_get QHTTPURL no CONNECT: %s', r.strip()[:80])
+                        return None
+                    s.write(url.encode())
+                    ok_r = b''
+                    for _ in range(8):
+                        ok_r += s.read(128)
+                        if b'OK' in ok_r:
+                            break
+
+                    r2 = self._scmd(s, f'AT+QHTTPGET={_HTTP_GET_TIMEOUT}',
+                                    wait_for='+QHTTPGET:', timeout=_HTTP_GET_TIMEOUT + 5)
+                    m = re.search(r'\+QHTTPGET: 0,\d+,(\d+)', r2)
+                    if not m:
+                        log.warning('http_get GET failed: %s', r2.strip()[:80])
+                        return None
+                    body_len = int(m.group(1))
+                    if body_len == 0:
+                        return b''
+
+                    r3 = self._scmd(s, 'AT+QHTTPREAD=10',
+                                    wait_for='+QHTTPREAD:', timeout=15)
+                    if 'CONNECT\r\n' in r3:
+                        start = r3.index('CONNECT\r\n') + len('CONNECT\r\n')
+                        end   = r3.rfind('\r\nOK')
+                        if end > start:
+                            return r3[start:end].strip().encode()
+                    return r3.strip().encode(errors='replace')
             except Exception as e:
-                log.error('Cannot write PPP peer config: %s', e)
-                return False
+                log.error('http_get error: %s', e)
+                return None
+
+    def http_put(self, url: str, data: bytes,
+                 content_type: str = 'application/octet-stream') -> bool:
+        """Upload bytes to URL via HTTP(S) PUT.
+        Holds _lock for the entire operation so the modem loop can't race.
+        Throughput ≈ 11 KB/s (UART bottleneck)."""
+        with self._lock:
+            if not self.is_bearer_active():
+                log.info('http_put: bearer inactive — reactivating')
+                if not self._activate_bearer():
+                    log.warning('http_put: bearer reactivation failed')
+                    return False
+
+            uart_seconds = max(60, int(len(data) / 10000) + 30)
+            total_wait   = uart_seconds + 105
 
             try:
-                self._ppp_proc = subprocess.Popen(
-                    ['pppd', self._device, str(self._baud), 'file', peer_path],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-                # Quectel docs: IPCP negotiation can take up to 90s
-                deadline = time.time() + max(self._connect_timeout, 120)
-                while time.time() < deadline:
-                    if self.is_online():
-                        log.info('PPP connected (APN=%s, %s)', apn, pdp)
-                        self._connected = True
+                with serial.Serial(self._device, self._baud, timeout=2.0) as s:
+                    self._scmd(s, 'AT+QHTTPSTOP', timeout=3)
+                    self._scmd(s, 'AT+QHTTPCFG="contextid",1')
+                    self._scmd(s, 'AT+QHTTPCFG="requestheader",0')
+                    self._scmd(s, 'AT+QHTTPCFG="responseheader",0')
+                    self._scmd(s, f'AT+QSSLCFG="sslversion",{_SSL_CTX},4')
+                    self._scmd(s, f'AT+QSSLCFG="ciphersuite",{_SSL_CTX},0xFFFF')
+                    self._scmd(s, f'AT+QSSLCFG="seclevel",{_SSL_CTX},0')
+                    self._scmd(s, f'AT+QHTTPCFG="sslctxid",{_SSL_CTX}')
+
+                    r_url = self._scmd(s, f'AT+QHTTPURL={len(url)},30',
+                                       wait_for='CONNECT', timeout=12)
+                    if 'CONNECT' not in r_url:
+                        log.warning('http_put QHTTPURL no CONNECT: %s', r_url.strip()[:80])
+                        return False
+                    s.write(url.encode())
+                    ok_r = b''
+                    for _ in range(8):
+                        ok_r += s.read(128)
+                        if b'OK' in ok_r:
+                            break
+                    log.debug('QHTTPURL OK: %s', ok_r.decode(errors='ignore')[:30])
+
+                    r_put = self._scmd(s, f'AT+QHTTPPUT={len(data)},{uart_seconds}',
+                                       wait_for='CONNECT', timeout=15)
+                    if 'CONNECT' not in r_put:
+                        log.warning('http_put QHTTPPUT no CONNECT: %s', r_put.strip()[:80])
+                        return False
+
+                    log.info('Sending %d bytes via UART (≈ %ds)…', len(data), uart_seconds)
+                    for i in range(0, len(data), 1024):
+                        s.write(data[i:i + 1024])
+
+                    resp_buf = b''
+                    deadline = time.time() + total_wait
+                    while time.time() < deadline:
+                        chunk = s.read(256)
+                        if chunk:
+                            resp_buf += chunk
+                            if b'+QHTTPPUT:' in resp_buf:
+                                break
+
+                    resp = resp_buf.decode(errors='ignore')
+                    log.debug('QHTTPPUT response: %s', resp.strip()[:120])
+                    m = re.search(r'\+QHTTPPUT:\s*(\d+),(\d+)', resp)
+                    if m and m.group(1) == '0' and m.group(2).startswith('2'):
+                        log.info('http_put: success HTTP %s (%d bytes)',
+                                 m.group(2), len(data))
                         return True
-                    time.sleep(2)
-
-                if pdp == 'IPV4V6':
-                    log.warning('Dual-stack PPP timed out — retrying IPv4 only')
-                    self._stop_ppp()
-                    self._pdp_type = 'IP'
-                    return self._start_ppp()
-
-                log.warning('PPP timed out (APN=%s)', apn)
-                self._stop_ppp()
-                return False
-
+                    log.warning('http_put failed: %s', resp.strip()[:120])
+                    return False
             except Exception as e:
-                log.error('PPP start failed: %s', e)
+                log.error('http_put error: %s', e)
                 return False
 
-
-    def _stop_ppp(self):
-        if self._ppp_proc:
-            try:
-                self._ppp_proc.terminate()
-                self._ppp_proc.wait(timeout=5)
-            except Exception:
-                pass
-            self._ppp_proc = None
-        self._connected = False
-
-    # ── LBS location ─────────────────────────────────────────────────────────
+    # ── Time sync ─────────────────────────────────────────────────────────────
 
     def sync_time(self) -> bool:
-        """Sync system clock from modem network time (AT+QLTS=2).
-        Response: +QLTS: "YYYY/MM/DD,HH:MM:SS+QQ,dst"  QQ = UTC offset in quarter-hours.
-        """
         try:
             resp = self._at('AT+QLTS=2', wait=2.0)
             m = re.search(
@@ -314,17 +400,15 @@ class ModemManager:
             result     = subprocess.run(['date', '-u', '-s', f'@{epoch}'],
                                         capture_output=True, timeout=5)
             if result.returncode == 0:
-                log.info('Clock synced via modem AT+QLTS: %s UTC', utc_dt.isoformat())
+                log.info('Clock synced via modem: %s UTC', utc_dt.isoformat())
                 return True
-            log.warning('date -s failed: %s', result.stderr.decode())
         except Exception as e:
             log.warning('sync_time error: %s', e)
         return False
 
+    # ── LBS location ──────────────────────────────────────────────────────────
+
     def get_location(self) -> Tuple[Optional[float], Optional[float]]:
-        """Cell-tower LBS via AT+CLBS (only when PPP not active)."""
-        if self._connected:
-            return None, None
         try:
             resp = self._at('AT+CLBS=1,1', wait=3.0)
             m = re.search(r'\+CLBS:\s*\d+,\s*([\d.]+),\s*([\d.]+)', resp)
