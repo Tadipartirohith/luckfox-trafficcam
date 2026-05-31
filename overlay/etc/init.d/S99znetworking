@@ -1,0 +1,15 @@
+#!/bin/sh
+# S99znetworking — add default route and DNS after S99usb0config sets usb0 IP.
+# S99u < S99z alphabetically, so this runs AFTER S99usb0config.
+# In production (modem PPP active) this is a no-op (default already via ppp0).
+case "$1" in
+    start)
+        if ! ip route show | grep -q '^default'; then
+            route add default gw 172.32.0.100 dev usb0 2>/dev/null || true
+            echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+            echo "S99znetworking: added default route via usb0 (172.32.0.100)"
+        fi
+        ;;
+    stop) ;;
+    *) exit 1 ;;
+esac
