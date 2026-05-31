@@ -134,24 +134,39 @@ class Uploader:
         prefix = f"{self._prefix}/{device_id}/{date_ist}/{chunk_id}"
 
         s3 = self._get_s3()
-        for local, key_suffix in [(item["video"], f"{chunk_id}.mp4"),
-                                   (item["sidecar"], f"{chunk_id}.json")]:
-            key = f"{prefix}/{key_suffix}"
-            log.info("Uploading s3://%s/%s", self._bucket, key)
-            boto3_ok = False
-            for attempt in range(1, self._max_retries + 1):
-                try:
-                    s3.upload_file(local, self._bucket, key)
-                    boto3_ok = True
-                    break
-                except Exception as e:
-                    log.warning("Upload attempt %d failed: %s", attempt, e)
-            if not boto3_ok:
-                # boto3 failed (no network interface) — try modem AT-command path
-                if not self._upload_via_modem(local, self._bucket, key):
-                    raise RuntimeError(
-                        f"All upload paths failed for {key_suffix}"
-                    )
+        video_key   = f"{prefix}/{chunk_id}.mp4"
+        sidecar_key = f"{prefix}/{chunk_id}.json"
+
+        # Sidecar first (<5 KB) — modem AT+QHTTPPUT fallback works
+        log.info("Uploading s3://%s/%s", self._bucket, sidecar_key)
+        sidecar_ok = False
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                s3.upload_file(item["sidecar"], self._bucket, sidecar_key)
+                sidecar_ok = True
+                break
+            except Exception as e:
+                log.warning("Sidecar attempt %d failed: %s", attempt, e)
+        if not sidecar_ok:
+            log.info("boto3 sidecar failed — trying modem AT-command path")
+            sidecar_ok = self._upload_via_modem(
+                item["sidecar"], self._bucket, sidecar_key)
+
+        # Video — large file, no modem fallback (UART too slow)
+        log.info("Uploading s3://%s/%s", self._bucket, video_key)
+        video_ok = False
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                s3.upload_file(item["video"], self._bucket, video_key)
+                video_ok = True
+                break
+            except Exception as e:
+                log.warning("Video attempt %d failed: %s", attempt, e)
+        if not video_ok:
+            log.info("Video boto3 failed — no modem fallback; queuing bundle to SD")
+            raise RuntimeError(f"Video upload failed for {chunk_id}")
+        if not sidecar_ok:
+            raise RuntimeError(f"All upload paths failed for sidecar {chunk_id}")
 
         log.info("Upload complete: %s", chunk_id)
         if self._cleanup:
