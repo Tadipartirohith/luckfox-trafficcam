@@ -382,7 +382,7 @@ class ChunkProcessor:
                  "-vf", f"select='not(mod(n\\,{sample_interval}))'",
                  "-vsync", "0", "-q:v", "2",
                  str(frames_dir / "frame_%04d.jpg")],
-                capture_output=True, check=False, timeout=120
+                capture_output=True, check=False, timeout=30
             )
         except Exception as e:
             log.warning("Frame extraction failed: %s", e)
