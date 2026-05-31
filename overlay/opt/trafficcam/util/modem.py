@@ -214,26 +214,11 @@ class ModemManager:
             log.info('Starting PPP: carrier=%s  APN=%s  PDP=%s',
                      self._carrier, apn, pdp)
 
-            # Write connect script to a file to avoid shell quoting issues
-            # with inline connect directives in the pppd peer file.
-            # BusyBox chat exits 3 after CONNECT (not 0); "|| exit 0" fixes that
-            # so pppd proceeds to LCP negotiation.
-            chat_lines = [
-                '#!/bin/sh',
-                '/usr/sbin/chat -v -t 60 \',
-                '  ABORT BUSY ABORT ERROR \',
-                "  '' ATZ \",
-                f"  OK 'AT+CGDCONT=1,\"\"{pdp}\"\",\"\"{apn}\"\"' \\",
-                '  OK ATD*99# \',
-                "  CONNECT '' || exit 0",
-            ]
-
-            # Build chat script without any escaping tricks
-            cgdcont_cmd = f"AT+CGDCONT=1,\"{pdp}\",\"{apn}\""
-            # Chat script in -f file format (official Quectel EC200U sequence).
-            # Using -f avoids all shell quoting ambiguity with inline args.
-            # Sequence: AT echo -> ATE0 -> CGDCONT -> ATD*99# -> CONNECT
-            cgdcont = f'AT+CGDCONT=1,\"{pdp}\",\"{apn}\"'
+            # Write chat script in -f scriptfile format.
+            # Official Quectel EC200U sequence (confirmed for Airtel India):
+            #   "" AT -> OK ATE0 -> OK CGDCONT -> OK ATD*99# -> CONNECT
+            # Using -f avoids all shell quoting issues with inline connect args.
+            cgdcont = 'AT+CGDCONT=1,"' + pdp + '","' + apn + '"'
             chat_conf = (
                 "ABORT 'BUSY'\n"
                 "ABORT 'NO CARRIER'\n"
@@ -241,7 +226,7 @@ class ModemManager:
                 "TIMEOUT 60\n"
                 "'' AT\n"
                 "OK ATE0\n"
-                f"OK '{cgdcont}'\n"
+                "OK '" + cgdcont + "'\n"
                 "OK 'ATD*99#'\n"
                 "CONNECT ''\n"
             )
@@ -249,7 +234,7 @@ class ModemManager:
                 f.write(chat_conf)
             import os as _os
             _os.chmod('/tmp/ppp_chat.conf', 0o644)
-            log.debug('Chat script written to /tmp/ppp_chat.sh')
+            log.debug('Chat conf:\n%s', chat_conf)
 
             peer_conf = (
                 'noauth\ndefaultroute\nusepeerdns\nnoipdefault\n'
@@ -257,7 +242,7 @@ class ModemManager:
             )
             if pdp == 'IPV4V6':
                 peer_conf += '+ipv6\n'
-            peer_conf += f'connect "/usr/sbin/chat -v -f /tmp/ppp_chat.conf"\n'
+            peer_conf += 'connect "/usr/sbin/chat -v -f /tmp/ppp_chat.conf"\n'
 
             peer_path = '/tmp/ppp_modem_peer'
             try:
@@ -272,7 +257,7 @@ class ModemManager:
                     ['pppd', self._device, str(self._baud), 'file', peer_path],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
-                # Quectel docs: IPCP can take 90s; ensure at least 120s total
+                # Quectel docs: IPCP negotiation can take up to 90s
                 deadline = time.time() + max(self._connect_timeout, 120)
                 while time.time() < deadline:
                     if self.is_online():
