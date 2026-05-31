@@ -338,6 +338,17 @@ class ChunkProcessor:
         det = config.get("detection", {})
         self._sample_n   = int(det.get("sample_every_n_seconds", 2))
         self._detector   = Detector(config)
+        # Only run frame extraction when at least one .rknn model file exists.
+        # If models are missing, ffmpeg would waste 30s per segment for nothing.
+        v_path = det.get("vehicle_model_path", "")
+        p_path = det.get("plate_model_path", "")
+        self._detection_enabled = (
+            (bool(v_path) and Path(v_path).exists()) or
+            (bool(p_path) and Path(p_path).exists())
+        )
+        if not self._detection_enabled:
+            log.info("Detection disabled (no .rknn models in %s)",
+                     str(Path(v_path).parent) if v_path else "models/")
         _probe_caps()  # warm up at startup
 
     async def run(self):
@@ -372,39 +383,40 @@ class ChunkProcessor:
             lat, lon = self._modem.get_location()
             location_source = "modem_lbs" if lat is not None else "none"
 
-        # Sample frames for detection
-        frames_dir = Path(f"/tmp/{chunk_id}_frames")
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        sample_interval = self._fps * self._sample_n
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", raw_path,
-                 "-vf", f"select='not(mod(n\\,{sample_interval}))'",
-                 "-vsync", "0", "-q:v", "2",
-                 str(frames_dir / "frame_%04d.jpg")],
-                capture_output=True, check=False, timeout=30
-            )
-        except Exception as e:
-            log.warning("Frame extraction failed: %s", e)
-
+        # Sample frames for detection — only when RKNN models are available.
+        # Skipped at startup if no .rknn files found (avoids 30s ffmpeg timeout).
         detections = []
-        for i, fp in enumerate(sorted(frames_dir.glob("frame_*.jpg"))):
+        if self._detection_enabled:
+            frames_dir = Path(f"/tmp/{chunk_id}_frames")
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            sample_interval = self._fps * self._sample_n
             try:
-                vehicles, plates = self._detector.detect(str(fp))
-                if vehicles or plates:
-                    detections.append({
-                        "frame_index": i * sample_interval,
-                        "vehicles":    vehicles,
-                        "plates":      plates,
-                    })
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", raw_path,
+                     "-vf", f"select='not(mod(n\\,{sample_interval}))'",
+                     "-vsync", "0", "-q:v", "2",
+                     str(frames_dir / "frame_%04d.jpg")],
+                    capture_output=True, check=False, timeout=30
+                )
             except Exception as e:
-                log.warning("Detection error on %s: %s", fp.name, e)
-        for fp in frames_dir.glob("*"):
-            fp.unlink(missing_ok=True)
-        try:
-            frames_dir.rmdir()
-        except Exception:
-            pass
+                log.warning("Frame extraction failed: %s", e)
+            for i, fp in enumerate(sorted(frames_dir.glob("frame_*.jpg"))):
+                try:
+                    vehicles, plates = self._detector.detect(str(fp))
+                    if vehicles or plates:
+                        detections.append({
+                            "frame_index": i * sample_interval,
+                            "vehicles":    vehicles,
+                            "plates":      plates,
+                        })
+                except Exception as e:
+                    log.warning("Detection error on %s: %s", fp.name, e)
+            for fp in frames_dir.glob("*"):
+                fp.unlink(missing_ok=True)
+            try:
+                frames_dir.rmdir()
+            except Exception:
+                pass
 
         # Encode with per-frame timestamp burned in
         out_path = self._proc_dir / f"{chunk_id}.mp4"
