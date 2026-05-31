@@ -244,37 +244,41 @@ def _encode_pipe(raw_path: str, out_path: str,
 def _encode(raw_path: str, out_path: str,
             start_epoch: int, fps: int, W: int, H: int) -> bool:
     """
-    Mux or encode raw H264 to MP4.
-
-    Strategy 1 (default): stream-copy — zero re-encode.
-      The new trafficcam_recorder_new already burns timestamps via hardware
-      RGN overlay, so no re-encode is needed. This is fast and lossless.
-
-    Fallback strategies are kept for legacy segments recorded without OSD.
+    Encode raw H264 to MP4 with burned-in per-frame timestamp.
+    Tries strategies in order; returns True on first success.
     """
+    font  = _find_font()
     caps  = _probe_caps()
     input_args = ["-y", "-i", raw_path]
     out_args   = ["-movflags", "+faststart", str(out_path)]
 
-    # ── Strategy 1: stream-copy (lossless, instant — OSD already in video) ───
+    # ── Strategy 1: HW encode via yuv2rkmpp pipe + drawtext ──────────────────
+    if caps["yuv2rkmpp"] and caps["drawtext"] and font:
+        if _encode_pipe(raw_path, out_path, font, start_epoch, W, H, fps):
+            log.info("Encoded with yuv2rkmpp pipe + drawtext (per-frame timestamp)")
+            return True
+        log.warning("yuv2rkmpp pipe failed, trying libx264")
+
+    # ── Strategy 2: stream-copy — preserves HW RGN OSD timestamp (instant) ─────
+    # trafficcam_recorder_new burns the timestamp into H264 pixels via RGN OSD.
+    # Stream-copy is lossless and ~100x faster than libx264 for 1080p@30fps.
     cmd = (["ffmpeg"] + input_args + ["-c:v", "copy"] + out_args)
-    if _run(cmd, "stream-copy", timeout=60):
-        log.info("stream-copy: timestamp already burned in by HW OSD")
+    if _run(cmd, "stream-copy"):
+        log.info("stream-copy (HW RGN timestamp preserved in video pixels)")
         return True
 
-    # ── Strategy 2 (legacy): libx264 + drawtext for old segments ─────────────
-    font = _find_font()
+    # ── Strategy 3: libx264 + drawtext (slow; SW timestamp fallback) ──────────
     if caps["libx264"] and caps["drawtext"] and font:
         vf = _drawtext_vf(font, start_epoch)
         cmd = (["ffmpeg"] + input_args +
                ["-vf", vf,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"] +
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"] +
                out_args)
         if _run(cmd, "libx264+drawtext", timeout=900):
-            log.info("Encoded with libx264 + drawtext (legacy fallback)")
+            log.info("Encoded with libx264 + drawtext (per-frame timestamp; slow)")
             return True
 
-    # ── Strategy 3: yuv2rkmpp, no drawtext ───────────────────────────────────
+    # ── Strategy 4: yuv2rkmpp, no drawtext ───────────────────────────────────
     if caps["yuv2rkmpp"]:
         tmp_h264 = out_path + ".notxt.h264"
         try:
@@ -293,7 +297,7 @@ def _encode(raw_path: str, out_path: str,
                 env=env,
             )
             ff.stdout.close()
-            enc.wait(timeout=20)
+            enc.wait(timeout=120)
             ff.wait(timeout=30)
             if Path(tmp_h264).stat().st_size > 0:
                 mux = ["ffmpeg", "-y", "-r", str(fps),
@@ -307,12 +311,6 @@ def _encode(raw_path: str, out_path: str,
         finally:
             try: os.unlink(tmp_h264)
             except Exception: pass
-
-    # ── Strategy 4: stream-copy (always works, no re-encode) ─────────────────
-    cmd = (["ffmpeg"] + input_args + ["-c:v", "copy"] + out_args)
-    if _run(cmd, "stream-copy"):
-        log.info("stream-copy (no timestamp in video pixels)")
-        return True
 
     log.error("All encode strategies failed for %s", raw_path)
     return False
@@ -384,7 +382,7 @@ class ChunkProcessor:
                  "-vf", f"select='not(mod(n\\,{sample_interval}))'",
                  "-vsync", "0", "-q:v", "2",
                  str(frames_dir / "frame_%04d.jpg")],
-                capture_output=True, check=False, timeout=20
+                capture_output=True, check=False, timeout=120
             )
         except Exception as e:
             log.warning("Frame extraction failed: %s", e)
