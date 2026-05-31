@@ -4,7 +4,7 @@ util/modem.py  —  Quectel EC200U carrier + AT-command bearer management.
 PPP over UART is NOT used: after ATD*99# the EC200U-CN goes completely silent
 on the UART (even LCP echo gets no response).  Instead we:
   1. Activate the PDP bearer with AT+CGACT=1,1  → real internet IP
-  2. Check connectivity with AT+QPING
+  2. Check connectivity with AT+CGPADDR=1 (Airtel blocks ICMP on PDP context)
   3. Upload files via AT+QHTTPPUT with pre-signed S3 URLs
   4. Sync time via AT+QLTS=2
 
